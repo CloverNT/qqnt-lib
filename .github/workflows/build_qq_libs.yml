@@ -1,0 +1,181 @@
+name: Build QQ NT libs (latest)
+
+# Periodically fetch the LATEST QQ NT release, build linkable artifacts for
+# Windows x64/arm64 and Linux x64/arm64, package each into a .zip, and upload
+# the four packages to a GitHub Release tagged `qq-<build>`.
+# A release whose four assets already exist is skipped (scheduled no-op).
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'      # every 12 hours (UTC)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild & re-upload even if the release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qq-libs-build
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.r.outputs.skip }}
+      tag: ${{ steps.r.outputs.tag }}
+      build: ${{ steps.r.outputs.build }}
+      winver3: ${{ steps.r.outputs.winver3 }}
+      linuxver3: ${{ steps.r.outputs.linuxver3 }}
+      update_date: ${{ steps.r.outputs.update_date }}
+      win_x64_url: ${{ steps.r.outputs.win_x64_url }}
+      win_arm64_url: ${{ steps.r.outputs.win_arm64_url }}
+      linux_x64_url: ${{ steps.r.outputs.linux_x64_url }}
+      linux_arm64_url: ${{ steps.r.outputs.linux_arm64_url }}
+      assets: ${{ steps.r.outputs.assets }}
+      existing: ${{ steps.r.outputs.existing }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }   # 22+ for zlib.zstdDecompressSync fallback
+      - id: r
+        run: node scripts/resolve.mjs
+        env:
+          FORCE: ${{ inputs.force }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Summary
+        run: |
+          {
+            echo "### QQ libs (latest)"
+            echo "- release tag: \`${{ steps.r.outputs.tag }}\` (build ${{ steps.r.outputs.build }}, ${{ steps.r.outputs.update_date }})"
+            echo "- windows ${{ steps.r.outputs.winver3 }} · linux ${{ steps.r.outputs.linuxver3 }}"
+            echo "- assets: ${{ steps.r.outputs.assets }}"
+            echo "- already on release: ${{ steps.r.outputs.existing }}"
+            echo "- skip: ${{ steps.r.outputs.skip }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Ensure the release exists once, so the parallel build jobs can upload to it
+  # without racing on release creation.
+  prepare-release:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.resolve.outputs.tag }}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists"
+          else
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+              --title "QQNT SDK · build ${{ needs.resolve.outputs.build }}" \
+              --notes "Import libs / linkable objects + matching Node/Electron headers (include as <QQNT/node.h>). Windows ${{ needs.resolve.outputs.winver3 }} · Linux ${{ needs.resolve.outputs.linuxver3 }} · build ${{ needs.resolve.outputs.build }} (${{ needs.resolve.outputs.update_date }}). See manifest.txt in each package for node/electron/v8 versions."
+          fi
+
+  # -------------------------------------------------------------------------
+  build-windows:
+    needs: [resolve, prepare-release]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: windows-latest
+    env:
+      # llvm-mingw: one toolchain for x64 + arm64 (gendef, llvm-dlltool, llvm-ar).
+      LLVM_MINGW_TAG: '20260602'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache llvm-mingw
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64
+          key: llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64
+
+      - name: Setup llvm-mingw
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ env.LLVM_MINGW_TAG }}"
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$tag/llvm-mingw-$tag-ucrt-x86_64.zip"
+          Write-Host "==> $url"
+          curl.exe -fL --retry 3 -o "$env:RUNNER_TEMP\llvm.zip" $url
+          if ($LASTEXITCODE -ne 0) { throw "llvm-mingw download failed" }
+          Expand-Archive "$env:RUNNER_TEMP\llvm.zip" -DestinationPath "C:\" -Force
+
+      - name: Add llvm-mingw to PATH
+        shell: pwsh
+        run: |
+          "C:\llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+
+      - name: Download installer
+        shell: pwsh
+        run: |
+          $arch = "${{ matrix.arch }}"
+          $url = if ($arch -eq "x64") { "${{ needs.resolve.outputs.win_x64_url }}" } else { "${{ needs.resolve.outputs.win_arm64_url }}" }
+          if (-not $url) { throw "no Windows $arch URL resolved" }
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          Write-Host "==> $url"
+          curl.exe -fL --retry 3 --connect-timeout 30 -o installer/QQ-setup.exe $url
+          if ($LASTEXITCODE -ne 0 -or (Get-Item installer/QQ-setup.exe).Length -lt 10485760) { throw "download failed" }
+
+      - name: Generate import libraries (gendef + llvm-dlltool)
+        shell: bash
+        run: |
+          bash scripts/gen_import_libs.sh \
+            installer/QQ-setup.exe out "${{ matrix.arch }}" "QQ.exe,QQNT.dll,wrapper.node"
+
+      - name: Package & upload to release
+        shell: pwsh
+        run: |
+          $folder = (Get-ChildItem out -Directory | Select-Object -First 1).Name
+          if (-not $folder) { throw "no output folder produced" }
+          Compress-Archive -Path "out/$folder" -DestinationPath "$folder.zip" -Force
+          Write-Host "uploading $folder.zip"
+          gh release upload "${{ needs.resolve.outputs.tag }}" "$folder.zip" -R $env:GITHUB_REPOSITORY --clobber
+
+  # -------------------------------------------------------------------------
+  build-linux:
+    needs: [resolve, prepare-release]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download package
+        run: |
+          arch="${{ matrix.arch }}"
+          if [ "$arch" = "x64" ]; then url="${{ needs.resolve.outputs.linux_x64_url }}"; else url="${{ needs.resolve.outputs.linux_arm64_url }}"; fi
+          [ -z "$url" ] && { echo "::error::no Linux $arch URL resolved"; exit 1; }
+          mkdir -p pkg
+          echo "==> $url"
+          curl -fL --retry 3 --connect-timeout 30 -o pkg/qq.deb "$url"
+
+      - name: Extract & copy linkable objects
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq file >/dev/null
+          bash scripts/extract_linux.sh pkg/qq.deb out "${{ matrix.arch }}"
+
+      - name: Package & upload to release
+        run: |
+          folder="$(ls -1 out | head -n1)"
+          [ -z "$folder" ] && { echo "::error::no output folder produced"; exit 1; }
+          ( cd out && zip -qr "../$folder.zip" "$folder" )
+          echo "uploading $folder.zip"
+          gh release upload "${{ needs.resolve.outputs.tag }}" "$folder.zip" -R "$GITHUB_REPOSITORY" --clobber

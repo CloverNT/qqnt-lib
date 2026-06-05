@@ -1,0 +1,11 @@
+# Normalize line endings to LF in the repo and on checkout everywhere, so the
+# bash scripts run correctly under `shell: bash` on the Windows CI runners
+# (which default to autocrlf=true and would otherwise check them out as CRLF).
+* text=auto eol=lf
+*.sh    text eol=lf
+*.mjs   text eol=lf
+*.cmake text eol=lf
+*.yml   text eol=lf
+*.cpp   text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf

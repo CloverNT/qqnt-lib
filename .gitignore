@@ -1,0 +1,15 @@
+# Pipeline working dirs (created during a run; never committed)
+.qqwork/
+out/
+installer/
+pkg/
+staging/
+
+# Local junk
+nul
+*.log
+
+.qqtest/
+
+# local editor/agent settings
+.claude/settings.local.json
