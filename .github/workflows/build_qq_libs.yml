@@ -91,8 +91,6 @@ jobs:
     if: needs.resolve.outputs.skip != 'true' && needs.resolve.outputs.win_matrix != '[]'
     runs-on: windows-latest
     env:
-      # llvm-mingw: one toolchain for x64 + arm64 (gendef, llvm-dlltool, llvm-ar).
-      LLVM_MINGW_TAG: '20260602'
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
@@ -101,28 +99,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache llvm-mingw
-        id: cache-llvm
-        uses: actions/cache@v4
-        with:
-          path: C:\llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64
-          key: llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64
-
-      - name: Setup llvm-mingw
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $tag = "${{ env.LLVM_MINGW_TAG }}"
-          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$tag/llvm-mingw-$tag-ucrt-x86_64.zip"
-          Write-Host "==> $url"
-          curl.exe -fL --retry 3 -o "$env:RUNNER_TEMP\llvm.zip" $url
-          if ($LASTEXITCODE -ne 0) { throw "llvm-mingw download failed" }
-          Expand-Archive "$env:RUNNER_TEMP\llvm.zip" -DestinationPath "C:\" -Force
-
-      - name: Add llvm-mingw to PATH
-        shell: pwsh
-        run: |
-          "C:\llvm-mingw-${{ env.LLVM_MINGW_TAG }}-ucrt-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+      # Puts MSVC lib.exe (the librarian) on PATH for the bash step below.
+      - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Download installer
         shell: pwsh
@@ -132,7 +110,7 @@ jobs:
           curl.exe -fL --retry 3 --connect-timeout 30 -o installer/QQ-setup.exe "${{ matrix.url }}"
           if ($LASTEXITCODE -ne 0 -or (Get-Item installer/QQ-setup.exe).Length -lt 10485760) { throw "download failed" }
 
-      - name: Generate import libraries (gendef + llvm-dlltool)
+      - name: Generate MSVC import libraries (pe -> .def -> lib.exe)
         shell: bash
         run: |
           bash scripts/gen_import_libs.sh \

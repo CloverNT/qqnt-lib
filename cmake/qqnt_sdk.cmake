@@ -251,42 +251,12 @@ set(QQNT_SDK_LIB_DIR     "${_qq_dir}/lib")
 set(_qq_libs "")
 if(QQNT_SDK_LINK_LIBS)
   if(_qq_sys STREQUAL "windows")
-    if(MSVC)
-      # MSVC can't consume the MinGW *.a import libs; synthesise *.lib from the
-      # shipped *.def with the MSVC librarian (cached: only built once).
-      find_program(QQNT_LIB_TOOL NAMES lib lib.exe)
-      if(QQNT_SDK_ARCH STREQUAL "arm64")
-        set(_qq_machine "ARM64")
-      else()
-        set(_qq_machine "X64")
-      endif()
-      if(QQNT_LIB_TOOL)
-        file(GLOB _qq_defs "${_qq_dir}/lib/*.def")
-        foreach(_def ${_qq_defs})
-          get_filename_component(_b "${_def}" NAME_WE)
-          set(_out "${_qq_dir}/lib/${_b}.lib")
-          if(NOT EXISTS "${_out}")
-            execute_process(COMMAND "${QQNT_LIB_TOOL}" "/nologo" "/def:${_def}"
-              "/machine:${_qq_machine}" "/out:${_out}" RESULT_VARIABLE _qq_lrc ERROR_VARIABLE _qq_lerr)
-            if(NOT _qq_lrc EQUAL 0)
-              message(WARNING "qqnt_sdk: lib.exe failed for ${_b}.def: ${_qq_lerr}")
-            endif()
-          endif()
-          if(EXISTS "${_out}")
-            list(APPEND _qq_libs "${_out}")
-          endif()
-        endforeach()
-      else()
-        message(WARNING "qqnt_sdk: MSVC detected but lib.exe not found — headers are configured, "
-                        "but import libs were not generated. Build in a VS dev environment, or "
-                        "use clang/MinGW to link the shipped *.a directly.")
-      endif()
-    else()
-      file(GLOB _qq_libs "${_qq_dir}/lib/*.a")   # MinGW/clang import libs
-    endif()
+    # The package ships genuine MSVC import libs (*.lib) — link them directly
+    # (works with MSVC and clang-cl; the matching .def files sit alongside).
+    file(GLOB _qq_libs "${_qq_dir}/lib/*.lib")
   else()
-    # Linux: link the native ELF shared objects directly. `qq` is the Electron
-    # executable (provided for reference) and is intentionally not linked.
+    # Linux: link the native ELF shared object (wrapper.node) directly. `qq` is
+    # the Electron executable (provided for reference) and is not linked.
     file(GLOB _qq_libs "${_qq_dir}/lib/*.node" "${_qq_dir}/lib/*.so")
   endif()
 endif()

@@ -3,15 +3,14 @@
 # extract_linux.sh
 #
 # Unpack a QQ NT Linux .deb (or .AppImage), detect its x.x.xx-xxxxx version,
-# copy out the Linux equivalents of the three Windows targets, and bundle the
-# matching Node/Electron headers - producing an SDK folder:
+# copy out the two native objects, and bundle the matching Node/Electron headers
+# - producing an SDK folder:
 #     qqnt-sdk-<version>-linux-<arch>/
-#       lib/qq , lib/wrapper.node , lib/major.node   (native ELF, link directly)
+#       lib/qq , lib/wrapper.node                     (native ELF, link directly)
 #       include/QQNT/...                              (via fetch_headers.sh)
 #       manifest.txt
 #
-#   QQ.exe       -> qq            wrapper.node -> wrapper.node
-#   QQNT.dll     -> major.node    (no libQQNT.so; QQNT native logic is in .node)
+#   collected: qq (Linux equivalent of QQ.exe) and wrapper.node
 #
 # Usage:  extract_linux.sh <package> <outroot> <arch:x64|arm64>
 # ---------------------------------------------------------------------------
@@ -43,12 +42,12 @@ case "$PKG" in
       dpkg-deb -x "$PKG_ABS" "$ROOT"
     elif command -v ar >/dev/null 2>&1; then               # any host with binutils
       ( cd "$WORK" && ar x "$PKG_ABS" )
-      data="$(find "$WORK" -maxdepth 1 -name 'data.tar.*' | head -n1)"
+      data="$(find "$WORK" -maxdepth 1 -name 'data.tar.*' | head -n1 || true)"
       tar -xf "$data" -C "$ROOT"
     else                                                    # Windows/macOS fallback
       sz="$(find_7z)"; [ -z "$sz" ] && { echo "::error::need dpkg-deb, ar, or 7-Zip" >&2; exit 1; }
       "$sz" x -y "-o${WORK}/ar" "$PKG_ABS" >/dev/null
-      data="$(find "$WORK/ar" -maxdepth 1 -name 'data.tar.*' | head -n1)"
+      data="$(find "$WORK/ar" -maxdepth 1 -name 'data.tar.*' | head -n1 || true)"
       [ -z "$data" ] && { echo "::error::no data.tar in deb" >&2; exit 1; }
       tar -xf "$data" -C "$ROOT"
     fi
@@ -62,10 +61,10 @@ case "$PKG" in
 esac
 
 # --- detect the real x.x.xx-xxxxx version ----------------------------------
-PJ="$(find "$WORK" -type f -path '*/resources/app/package.json' 2>/dev/null | head -n1)"
+PJ="$(find "$WORK" -type f -path '*/resources/app/package.json' 2>/dev/null | head -n1 || true)"
 VER=""
 [ -n "$PJ" ] && VER="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$PJ" \
-    | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1)"
+    | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1 || true)"
 if [ -z "$VER" ]; then
   echo "::error::could not detect QQ version (no resources/app/package.json). Tree:" >&2
   find "$WORK" -maxdepth 7 -type f -name package.json | head -n 40 >&2
@@ -83,16 +82,15 @@ find_one() {
     | sort -rn | head -n1 | cut -f2- || true
 }
 
-declare -A WANT=( [qq]=qq [wrapper.node]=wrapper.node [major.node]=major.node )
+declare -A WANT=( [qq]=qq [wrapper.node]=wrapper.node )
 
 MANIFEST="$OUTDIR/manifest.txt"
 { echo "version=$VER"; echo "system=linux"; echo "arch=$ARCH"; } > "$MANIFEST"
 copied=0; missing=(); QQBIN=""
 
-for name in qq wrapper.node major.node libQQNT.so; do
+for name in qq wrapper.node; do
   src="$(find_one "$name")"
   if [ -z "$src" ]; then
-    [ "$name" = "libQQNT.so" ] && continue
     echo "::warning::not found: $name"; missing+=("$name"); continue
   fi
   [ "$name" = "qq" ] && QQBIN="$src"
@@ -121,5 +119,7 @@ fi
 bash "$SCRIPT_DIR/fetch_headers.sh" "$QQBIN" "$OUTDIR"
 
 echo "==> SDK ready: $OUTDIR"
-ls -lR "$OUTDIR" | head -n 40
+# `|| true`: head closes the pipe early -> ls gets SIGPIPE; don't let that fail
+# the step (pipefail+set -e) after the SDK is already built.
+ls -lR "$OUTDIR" | head -n 40 || true
 exit 0

@@ -2,18 +2,19 @@
 # ---------------------------------------------------------------------------
 # gen_import_libs.sh  (bash; CI runs it with `shell: bash` = Git Bash on Windows)
 #
-# Extract a QQ NT Windows installer, detect its real x.x.xx-xxxxx version, build
-# an import library + .def for each requested PE target, and bundle the matching
-# Node/Electron headers - producing an SDK folder:
+# Extract a QQ NT Windows installer, detect its real x.x.xx-xxxxx version, build a
+# genuine MSVC import library (+ its .def) for each requested PE target, and
+# bundle the matching Node/Electron headers - producing an SDK folder:
 #     qqnt-sdk-<version>-windows-<arch>/
-#       lib/<name>.def , lib/lib<name>.a        (gendef + llvm-dlltool)
+#       lib/<name>.def , lib/<name>.lib          (PE exports -> MSVC lib.exe)
 #       include/QQNT/...                          (via fetch_headers.sh)
 #       manifest.txt
+#   e.g. QQNT.dll -> QQNT.lib, QQ.exe -> QQ.lib, wrapper.node -> wrapper.lib
 #
 # Usage:  gen_import_libs.sh <installer.exe> <outroot> <arch:x64|arm64> <t1,t2,...>
 #
-# Requires gendef + llvm-dlltool on PATH (llvm-mingw); find/sort/grep/tar from
-# Git Bash; 7-Zip from the Windows install. `file` optional (logging only).
+# Requires MSVC lib.exe on PATH (add the 'ilammy/msvc-dev-cmd' step) and node;
+# find/sort/grep/tar from Git Bash; 7-Zip from the Windows install. `file` optional.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -53,9 +54,9 @@ detect_version() {
         -regex '.*/versions/[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' -printf '%f\n' 2>/dev/null \
         | sort -V | tail -n1)"
   if [ -z "$v" ]; then
-    local pj; pj="$(find "$EXTRACT" -type f -path '*/resources/app/package.json' 2>/dev/null | head -n1)"
+    local pj; pj="$(find "$EXTRACT" -type f -path '*/resources/app/package.json' 2>/dev/null | head -n1 || true)"
     [ -n "$pj" ] && v="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pj" \
-        | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1)"
+        | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1 || true)"
   fi
   echo "$v"
 }
@@ -71,15 +72,15 @@ LIBDIR="$OUTDIR/lib"
 mkdir -p "$LIBDIR"
 echo "==> Detected version $VER  ->  $FOLDER"
 
-# --- import-lib tool (llvm-mingw: one tool, both arches) -------------------
-DLLTOOL="${DLLTOOL:-llvm-dlltool}"
+# --- MSVC import-lib toolchain (lib.exe + node to read PE exports) ----------
 case "$ARCH" in
-  x64)   MFLAGS=(-m i386:x86-64) ;;
-  arm64) MFLAGS=(-m arm64) ;;
+  x64)   MACHINE=X64 ;;
+  arm64) MACHINE=ARM64 ;;
   *)     echo "::error::unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
-command -v gendef    >/dev/null 2>&1 || { echo "::error::gendef not on PATH (need llvm-mingw)" >&2; exit 1; }
-command -v "$DLLTOOL" >/dev/null 2>&1 || { echo "::error::$DLLTOOL not on PATH (need llvm-mingw)" >&2; exit 1; }
+LIB_EXE="$(command -v lib.exe || command -v lib || true)"
+[ -z "$LIB_EXE" ] && { echo "::error::MSVC lib.exe not on PATH — add the 'ilammy/msvc-dev-cmd' step" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "::error::node not on PATH (needed to read PE exports)" >&2; exit 1; }
 
 find_target() {
   local name="$1"
@@ -88,7 +89,7 @@ find_target() {
 }
 
 MANIFEST="$OUTDIR/manifest.txt"
-{ echo "version=$VER"; echo "system=windows"; echo "arch=$ARCH"; echo "tool=$DLLTOOL"; } > "$MANIFEST"
+{ echo "version=$VER"; echo "system=windows"; echo "arch=$ARCH"; echo "tool=msvc-lib"; } > "$MANIFEST"
 made=0; missing=()
 
 IFS=',' read -ra LIST <<< "$TARGETS"
@@ -100,9 +101,11 @@ for raw in "${LIST[@]}"; do
   fi
   base="${target%.*}"
   echo "==> $target  ->  $file_path"; file "$file_path" || true
-  def="$LIBDIR/${base}.def"; lib="$LIBDIR/lib${base}.a"
-  gendef - "$file_path" > "$def"
-  "$DLLTOOL" "${MFLAGS[@]}" -d "$def" -D "$target" -l "$lib"
+  def="$LIBDIR/${base}.def"; lib="$LIBDIR/${base}.lib"
+  node "$SCRIPT_DIR/pe_to_def.mjs" "$file_path" "$target" "$def"
+  # MSYS2_ARG_CONV_EXCL: stop Git Bash from mangling lib.exe's /flag arguments.
+  MSYS2_ARG_CONV_EXCL='*' "$LIB_EXE" /nologo "/def:$def" "/out:$lib" "/machine:$MACHINE"
+  rm -f "$LIBDIR/${base}.exp"   # lib.exe /def byproduct, not needed by consumers
   sz=$(stat -c '%s' "$lib" 2>/dev/null || echo '?')
   echo "    -> lib/$(basename "$lib") (${sz} bytes), lib/$(basename "$def")"
   echo "target=$target source=$file_path def=lib/$(basename "$def") importlib=lib/$(basename "$lib") (${sz}B)" >> "$MANIFEST"
@@ -123,10 +126,12 @@ fi
 # Electron version lives in QQNT.dll (the framework module). If a future build
 # renames it, fall back to the largest .dll (the framework). NOT QQ.exe - that
 # is only a small launcher stub and carries no "Electron/<ver>" string.
-hdrbin="$(find "$EXTRACT" -iname QQNT.dll | head -n1)"
+hdrbin="$(find "$EXTRACT" -iname QQNT.dll | head -n1 || true)"
 [ -z "$hdrbin" ] && hdrbin="$(find "$EXTRACT" -type f -iname '*.dll' -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -n1 | cut -f2- || true)"
 [ -z "$hdrbin" ] && { echo "::error::no binary found to detect Electron version" >&2; exit 1; }
 bash "$SCRIPT_DIR/fetch_headers.sh" "$hdrbin" "$OUTDIR"
 
 echo "==> SDK ready: $OUTDIR"
-ls -lR "$OUTDIR" | head -n 40
+# `|| true`: head closes the pipe early -> ls gets SIGPIPE; don't let that fail
+# the step (pipefail+set -e) after the SDK is already built.
+ls -lR "$OUTDIR" | head -n 40 || true

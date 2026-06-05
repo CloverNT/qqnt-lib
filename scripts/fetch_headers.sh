@@ -55,7 +55,7 @@ tar -xzf "$WORK/headers.tgz" -C "$WORK"
 
 # 4) Remap include/node/* -> include/QQNT/* so <QQNT/node.h> resolves and the
 #    headers' internal "v8.h" / "cppgc/..." / "libplatform/..." refs stay valid.
-src="$(find "$WORK" -type d -path '*/include/node' | head -n1)"
+src="$(find "$WORK" -type d -path '*/include/node' | head -n1 || true)"
 [ -z "$src" ] && { echo "::error::include/node not found in headers tarball" >&2; exit 1; }
 mkdir -p "$OUT/include"
 rm -rf "$OUT/include/QQNT"
