@@ -119,6 +119,12 @@ download page (`im.qq.com/pcqq/index.shtml`, `…/linuxqq/index.shtml`), reads i
 `gtimg.cn`, which works worldwide from CI). It keys the release on the Windows
 3-part version + date code + the per-build content hash from the `…/release/<hash>/`
 URL segment (so same-day rebuilds get a distinct release) — no partial-download.
+
+To guard against the rare case where `cdn-go`'s `/latest/` edge serves a *stale*
+config to a runner (pointing at versions QQ's CDN has already pruned), the
+resolver `HEAD`s the four download URLs **directly against QQ's CDN** — no
+third-party version list — and fails the run if any 404, so it never builds an
+ancient version; the next scheduled run lands on a fresh edge.
 The exact `x.x.xx-xxxxx` build is detected from the binaries themselves (Windows
 `versions/<ver>` folder, Linux `resources/app/package.json`) and goes into the
 asset names + `manifest.txt`.

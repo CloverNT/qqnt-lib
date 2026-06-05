@@ -41,8 +41,16 @@ async function fetchText(url, tries = 4) {
   let last;
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0 qq-lib-autogen" },
+      // Best-effort cache-bust + revalidate. (cdn-go's COS edge mostly ignores
+      // the query for its cache key, so this is not a reliable fix on its own —
+      // the freshness floor check below is what actually guards against stale.)
+      const u = url + (url.includes("?") ? "&" : "?") + "_cb=" + Date.now() + "." + i;
+      const r = await fetch(u, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 qq-lib-autogen",
+          "Cache-Control": "no-cache, no-store, max-age=0",
+          Pragma: "no-cache",
+        },
         signal: AbortSignal.timeout(30000),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -53,6 +61,27 @@ async function fetchText(url, tries = 4) {
     }
   }
   throw new Error(`fetch failed for ${url}: ${last}`);
+}
+
+// Liveness check, straight against QQ's CDN (no third-party version list): HEAD
+// the resolved download URL. A stale '/latest/' edge points at pruned files,
+// which QQ returns 404 for. (Uses HEAD, not a Range GET — gtimg can reject Range
+// from some CI IPs.)
+async function urlLive(url) {
+  if (!url) return true;
+  try {
+    const r = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 qq-lib-autogen" },
+      signal: AbortSignal.timeout(30000),
+    });
+    // 403/404/410 => pruned/gone (dead). Anything else (2xx, 405, transient 5xx)
+    // => treat as live and let the build job's actual download settle it.
+    return ![403, 404, 410].includes(r.status);
+  } catch {
+    return true; // network hiccup: don't false-fail; the build job will retry
+  }
 }
 
 // Rainbow config: `;(function(){var params= {...};  ...})()` -> pull the JSON.
@@ -121,6 +150,30 @@ for (const [k, v] of Object.entries(out))
 
 if (!out.win_x64_url && !out.linux_x64_url)
   fail("frontend returned no download URLs (config shape changed or unreachable).");
+
+// --- stale-config guard (QQ-only) ------------------------------------------
+// cdn-go's "/latest/" rainbow config has been observed serving months-old
+// content to some CI runners (e.g. 9.9.21 instead of 9.9.31), whose CDN files
+// are pruned. Verify the resolved URLs are actually downloadable on QQ's CDN; if
+// a stale config points at pruned (404) files, reject rather than build an
+// ancient version that would 404 in the build jobs. A later run hits a fresh edge.
+// (Cross-check: windows and linux of one release share a date code.)
+const winDate = (out.win_x64_url.match(/_(\d{6})_/) || [])[1] || "";
+const linDate = (out.linux_x64_url.match(/_(\d{6})_/) || [])[1] || "";
+if (winDate && linDate && winDate !== linDate)
+  console.error(`::warning::resolve: windows date ${winDate} != linux date ${linDate} — possible stale cache on one config.`);
+
+const live = await Promise.all(
+  [["win-x64", out.win_x64_url], ["win-arm64", out.win_arm64_url],
+   ["linux-x64", out.linux_x64_url], ["linux-arm64", out.linux_arm64_url]]
+    .map(async ([k, u]) => [k, u, await urlLive(u)]));
+for (const [k, u, ok] of live) if (u) console.log(`::notice::resolve: ${ok ? "live" : "DEAD"} ${k} -> ${u}`);
+const dead = live.filter(([, u, ok]) => u && !ok).map(([k]) => k);
+if (dead.length)
+  fail(
+    `resolved download URL(s) not live on QQ's CDN: ${dead.join(", ")}. cdn-go's '/latest/' edge served ` +
+    `this runner a stale config pointing at pruned files. Re-run — a later run usually hits a fresh edge.`
+  );
 
 // Date code (YYMMDD), and the per-build content hash from the .../release/<hash>/
 // path segment. Tencent occasionally ships same-day rebuilds (same date, new
